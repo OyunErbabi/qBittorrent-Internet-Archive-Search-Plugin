@@ -1,111 +1,135 @@
 # -*- coding: utf-8 -*-
-# VERSION: 1.0
+# VERSION: 1.1
 # AUTHORS: OyunErbabi
 
 import json
-import math
+import re
+import sys
 import urllib.request
 import urllib.parse
 import urllib.error
+from datetime import datetime
 from novaprinter import prettyPrinter
 
 class internetarchive(object):
     name = "Internet Archive"
     url = "https://archive.org"
-    supported_categories = {'all': 'all'}
-    
-    def convert_size(self, size_bytes):
-        
-        if size_bytes == 0:
-            return "0B"
-        size_names = ["B", "KB", "MB", "GB", "TB"]
-        i = int(math.floor(math.log(size_bytes, 1024)))
-        p = math.pow(1024, i)
-        s = round(size_bytes / p, 2)
-        return f"{s} {size_names[i]}"
+    # qBittorrent kategorisi -> archive.org mediatype
+    supported_categories = {
+        'all': None,
+        'movies': 'movies',
+        'tv': 'movies',
+        'music': 'audio',
+        'books': 'texts',
+        'software': 'software',
+        'games': 'software',
+        'pictures': 'image',
+    }
+
+    rows_per_page = 100
+    max_results = 200
 
     def retrieve_url(self, url):
-        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+            'Accept': 'application/json'
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read().decode('utf-8')
+
+    def build_terms(self, what):
+        # Tırnak içindeki ifadeleri koru, diğer kelimelerden Lucene özel karakterlerini temizle
+        terms = []
+        for phrase, word in re.findall(r'"([^"]+)"|(\S+)', what):
+            if phrase:
+                phrase = re.sub(r'["\\]', ' ', phrase).strip()
+                if phrase:
+                    terms.append(f'"{phrase}"')
+            else:
+                word = re.sub(r'[+\-&|!(){}\[\]^"~*?:\\/]', ' ', word).strip()
+                terms.extend(f'"{w}"' if w in ('AND', 'OR', 'NOT') else w for w in word.split())
+        return " AND ".join(terms)
+
+    def fetch_page(self, query, page):
+        params = [
+            ('q', query),
+            ('fl[]', 'identifier'),
+            ('fl[]', 'title'),
+            ('fl[]', 'item_size'),
+            ('fl[]', 'publicdate'),
+            ('sort[]', 'downloads desc'),
+            ('rows', self.rows_per_page),
+            ('page', page),
+            ('output', 'json'),
+        ]
+        search_url = "https://archive.org/advancedsearch.php?" + urllib.parse.urlencode(params)
+        data = json.loads(self.retrieve_url(search_url))
+        response = data.get('response', {})
+        return response.get('docs', []), response.get('numFound', 0)
+
+    def parse_date(self, value):
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'application/json, text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-            }
-            req = urllib.request.Request(url, headers=headers)
-            
-            with urllib.request.urlopen(req, timeout=30) as response:
-                return response.read().decode('utf-8')
-                
-        except urllib.error.URLError as e:
-            print(f"URL Error: {e.reason}")
-            raise
-        except Exception as e:
-            print(f"Error retrieving URL: {e}")
-            raise   
+            return int(datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").timestamp())
+        except (TypeError, ValueError):
+            return -1
 
     def search(self, what, cat='all'):
-        
-        what_decoded = urllib.parse.unquote(what)
-        what_encoded = what_decoded.replace(' ', '+')
-        
-        page = 1
-        has_more_results = True
-        result_count = 0
-        
-        while has_more_results:
-            search_url = f"https://archive.org/advancedsearch.php?q={what_encoded}&output=json&rows=50&page={page}&fl[]=identifier,title,format,item_size"
-            
+        # qBittorrent arama metnini URL-encode edilmiş olarak gönderir (%20, %26 ...)
+        terms = self.build_terms(urllib.parse.unquote(what))
+        if not terms:
+            return
+
+        filters = ' AND format:"Archive BitTorrent"'
+        mediatype = self.supported_categories.get(cat)
+        if mediatype:
+            filters += f' AND mediatype:{mediatype}'
+
+        # Önce başlıkta ara (çok daha alakalı sonuçlar), sonuç yoksa tüm metinde ara
+        for query in (f'title:({terms}){filters}', f'({terms}){filters}'):
             try:
-                response_text = self.retrieve_url(search_url)
-                data = json.loads(response_text)
+                result_count = self.search_query(query)
             except Exception as e:
-                print(f"Error retrieving or parsing data: {e}")
+                # stdout sadece sonuç satırları içindir, hatalar stderr'e
+                print(f"Internet Archive search error: {e}", file=sys.stderr)
+                return
+            if result_count:
                 return
 
-            docs = data.get('response', {}).get('docs', [])
+    def search_query(self, query):
+        page = 1
+        result_count = 0
+
+        while result_count < self.max_results:
+            docs, total_results = self.fetch_page(query, page)
             if not docs:
-                has_more_results = False
-                if page == 1 and result_count == 0:
-                    print("No results found")
                 break
 
             for doc in docs:
                 identifier = doc.get('identifier')
                 if not identifier:
-                    continue                   
-                
-                formats = doc.get('format', [])
-                has_torrent = any("BitTorrent" in str(f) for f in formats)
-                if not has_torrent:
                     continue
-                    
-                
-                item_size_bytes = doc.get('item_size', 0)
-                size_str = self.convert_size(item_size_bytes)
-                    
-                
-                title = doc.get('title', identifier)
+
+                title = doc.get('title') or identifier
                 if isinstance(title, list):
                     title = title[0] if title else identifier
-                    
-                result = {
-                    'name': title,
+
+                prettyPrinter({
+                    'name': str(title),
                     'link': f"https://archive.org/download/{identifier}/{identifier}_archive.torrent",
-                    'size': size_str,
-                    'seeds': '-1',
-                    'leech': '-1',
+                    'size': int(doc.get('item_size') or 0),
+                    'seeds': -1,
+                    'leech': -1,
                     'engine_url': self.url,
-                    'desc_link': f"https://archive.org/details/{identifier}"
-                }
-                prettyPrinter(result)
+                    'desc_link': f"https://archive.org/details/{identifier}",
+                    'pub_date': self.parse_date(doc.get('publicdate')),
+                })
                 result_count += 1
-            
-            page += 1
-            
-            if result_count >= 200:
-                print("Reached maximum result limit (200 items)")
+                if result_count >= self.max_results:
+                    break
+
+            if page * self.rows_per_page >= total_results:
                 break
-            
-            total_results = data.get('response', {}).get('numFound', 0)
-            if page * 50 >= total_results:
-                has_more_results = False
+            page += 1
+
+        return result_count
